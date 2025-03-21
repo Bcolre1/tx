@@ -1,0 +1,2423 @@
+const { Telegraf, Scenes, session, Markup } = require('telegraf');
+const express = require('express');
+const mongoose = require('mongoose');
+const cron = require('node-cron');
+const axios = require('axios');
+require('dotenv').config();
+
+// Express server to keep the bot alive on Glitch
+const app = express();
+const port = process.env.PORT || 3000;
+
+// Basic route
+app.get('/', (req, res) => {
+  res.send('Bot is running!');
+});
+
+// Add the ping route
+app.get('/ping', (req, res) => {
+  // Set headers to prevent caching and allow monitoring services
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  
+  // Send a simple response
+  res.status(200).send('Bot is alive!');
+});
+
+// Start the server
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
+
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    const projectUrl = 'https://leather-shaded-macadamia.glitch.me';
+    console.log(`Self-pinging ${projectUrl} to stay awake...`);
+    await axios.get(`${projectUrl}`);
+  } catch (error) {
+    console.error('Error self-pinging:', error.message);
+  }
+});
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Define schemas
+const userSchema = new mongoose.Schema({
+  userId: { type: Number, required: true, unique: true },
+  username: String,
+  walletBalance: { type: Number, default: 0 },
+  purchases: [{
+    scriptType: String,
+    purchaseDate: Date,
+    expiryDate: Date,
+    vpsLogin: String,
+    price: Number
+  }],
+  pendingDeposits: [{
+    amount: Number,
+    txid: String,
+    timestamp: Date,
+    confirmed: { type: Boolean, default: false }
+  }],
+  cookiePurchases: [{
+    cookieId: { type: mongoose.Schema.Types.ObjectId, ref: 'CookieLink' },
+    name: String,
+    purchaseDate: Date,
+    accessDetails: String,
+    delivered: { type: Boolean, default: false }
+  }],
+  smtpPurchases: [{
+    smtpId: { type: mongoose.Schema.Types.ObjectId, ref: 'SmtpServer' },
+    name: String,
+    purchaseDate: Date,
+    details: String,
+    delivered: { type: Boolean, default: false }
+  }],
+  pagePurchases: [{
+    pageId: { type: mongoose.Schema.Types.ObjectId, ref: 'Page' },
+    name: String,
+    purchaseDate: Date,
+    accessDetails: String,
+    delivered: { type: Boolean, default: false }
+  }],
+  registrationDate: { type: Date, default: Date.now }
+});
+const pageSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  price: { type: Number, required: true },
+  description: String,
+  active: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const cookieLinkSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  price: { type: Number, required: true },
+  previewLink: String,
+  description: String,
+  active: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const smtpServerSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  price: { type: Number, required: true },
+  pcsRemaining: { type: Number, default: 0 },
+  description: String,
+  active: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', userSchema);
+const Page = mongoose.model('Page', pageSchema);
+const CookieLink = mongoose.model('CookieLink', cookieLinkSchema);
+const SmtpServer = mongoose.model('SmtpServer', smtpServerSchema);
+
+// Initialize bot
+const bot = new Telegraf(process.env.BOT_TOKEN);
+bot.use(session());
+
+// Admin ID
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+
+// Script details
+const scripts = {
+  'bhb_toolkit_pro': {
+    name: 'BHB Toolkit Pro',
+    price: 100,
+    renewalPrice: 30,
+    description: 'Advanced toolkit for email & sms marketers'
+  },
+  'bhb_365_lair': {
+    name: 'BHB 365 Lair',
+    price: 250,
+    renewalPrice: 50,
+    description: 'Comprehensive Python solution for 365 marketing'
+  }
+};
+
+// Main menu keyboard
+const mainMenuKeyboard = Markup.keyboard([
+  ['🛒 Shop', '💰 My Account'],
+  ['💵 Deposit USDT', '🔄 Renewals'],
+  ['❓ Help']
+]).resize();
+
+// Shop submenu keyboard
+const shopMenuKeyboard = Markup.keyboard([
+  ['📜 Scripts', '🍪 Cookie Links', '📧 SMTP Servers'],
+  ['📄 S.page', '🔙 Back to Main Menu']
+]).resize();
+
+// Admin menu keyboard
+const adminMenuKeyboard = Markup.keyboard([
+  ['👥 View Users', '💲 Confirm Deposits'],
+  ['📤 Pending Deliveries', '📊 Sales Report'],
+  ['🍪 Manage Cookies', '📧 Manage SMTPs'],
+  ['📄 Manage Pages', '📢 Send Notification'],
+  ['🔙 Exit Admin Mode']
+]).resize();
+
+// Start command
+bot.start(async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const username = ctx.from.username || 'Unknown';
+    
+    // Check if user exists, if not create a new user
+    let user = await User.findOne({ userId });
+    if (!user) {
+      user = new User({
+        userId,
+        username,
+        walletBalance: 0,
+        purchases: [],
+        pendingDeposits: [],
+        cookiePurchases: [],
+        smtpPurchases: []
+      });
+      await user.save();
+    }
+    
+    // Welcome message
+    await ctx.reply(`Welcome to BHB Lair Bot! 🚀\n\nHere you can purchase BHB scripts:\n\n1. BHB Toolkit Pro - $100 (renewal: $30/month)\n2. BHB 365 Lair - $250 (renewal: $50/month)\n\nWe also offer Cookie Links and Sending Servers!\n\nUse the menu below to navigate:`, mainMenuKeyboard);
+    
+    // If admin, show admin command
+    if (ctx.from.id.toString() === ADMIN_CHAT_ID) {
+      await ctx.reply('Admin commands available. Type /admin to access admin panel.');
+    }
+  } catch (error) {
+    console.error('Error in start command:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin command
+bot.command('admin', async (ctx) => {
+  if (ctx.from.id.toString() === ADMIN_CHAT_ID) {
+    await ctx.reply('Welcome to Admin Panel', adminMenuKeyboard);
+  } else {
+    await ctx.reply('You are not authorized to use admin commands.');
+  }
+});
+
+// Exit admin mode
+bot.hears('🔙 Exit Admin Mode', async (ctx) => {
+  if (ctx.from.id.toString() === ADMIN_CHAT_ID) {
+    await ctx.reply('Exited admin mode. Back to user menu.', mainMenuKeyboard);
+  }
+});
+
+// Handle account info
+bot.hears('💰 My Account', async (ctx) => {
+  try {
+    const user = await User.findOne({ userId: ctx.from.id });
+    if (!user) {
+      return ctx.reply('Your account was not found. Please use /start to register.');
+    }
+    
+    let message = `📊 *Account Information*\n\n`;
+    message += `Username: @${user.username || 'Not set'}\n`;
+    message += `Wallet Balance: $${user.walletBalance.toFixed(2)}\n\n`;
+    
+    if (user.purchases.length > 0) {
+      message += `*Your Scripts:*\n`;
+      user.purchases.forEach((purchase, index) => {
+        const expiryDate = new Date(purchase.expiryDate);
+        message += `${index + 1}. ${purchase.scriptType}\n`;
+        message += `   Expires: ${expiryDate.toLocaleDateString()}\n`;
+      });
+    } else {
+      message += `You haven't purchased any scripts yet.\n`;
+    }
+    
+    if (user.cookiePurchases && user.cookiePurchases.length > 0) {
+      message += `\n*Your Cookie Links:*\n`;
+      user.cookiePurchases.forEach((purchase, index) => {
+        message += `${index + 1}. ${purchase.name}\n`;
+        message += `   Purchased: ${new Date(purchase.purchaseDate).toLocaleDateString()}\n`;
+        message += `   Status: ${purchase.delivered ? 'Delivered' : 'Pending'}\n`;
+      });
+    }
+    
+    if (user.smtpPurchases && user.smtpPurchases.length > 0) {
+      message += `\n*Your SMTP Servers:*\n`;
+      user.smtpPurchases.forEach((purchase, index) => {
+        message += `${index + 1}. ${purchase.name}\n`;
+        message += `   Purchased: ${new Date(purchase.purchaseDate).toLocaleDateString()}\n`;
+        message += `   Status: ${purchase.delivered ? 'Delivered' : 'Pending'}\n`;
+      });
+    }
+    
+    if (user.pendingDeposits.some(deposit => !deposit.confirmed)) {
+      message += `\n\n*Pending Deposits:*\n`;
+      user.pendingDeposits.forEach((deposit, index) => {
+        if (!deposit.confirmed) {
+          message += `$${deposit.amount.toFixed(2)} (awaiting confirmation)\n`;
+        }
+      });
+    }
+    
+    await ctx.replyWithMarkdown(message);
+  } catch (error) {
+    console.error('Error in account info:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Shop menu
+bot.hears('🛒 Shop', async (ctx) => {
+  await ctx.reply('Please select a category:', shopMenuKeyboard);
+});
+
+// Back to main menu
+bot.hears('🔙 Back to Main Menu', async (ctx) => {
+  await ctx.reply('Main Menu:', mainMenuKeyboard);
+});
+
+// Scripts submenu
+bot.hears('📜 Scripts', async (ctx) => {
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('BHB Toolkit Pro - $100', 'buy_bhb_toolkit_pro')],
+    [Markup.button.callback('BHB 365 Lair - $250', 'buy_bhb_365_lair')]
+  ]);
+  
+  await ctx.reply('Select a script to purchase:', keyboard);
+});
+
+// Handle script purchase
+bot.action(/buy_(.+)/, async (ctx) => {
+  try {
+    const scriptId = ctx.match[1];
+    const script = scripts[scriptId];
+    
+    if (!script) {
+      await ctx.answerCbQuery('Script not found.');
+      return ctx.reply('Script not found.');
+    }
+    
+    const user = await User.findOne({ userId: ctx.from.id });
+    if (!user) {
+      await ctx.answerCbQuery('Account not found.');
+      return ctx.reply('Your account was not found. Please use /start to register.');
+    }
+    
+    if (user.walletBalance < script.price) {
+      await ctx.answerCbQuery('Insufficient balance.');
+      return ctx.reply(`Insufficient balance. You need $${script.price.toFixed(2)} to purchase ${script.name}. Your current balance is $${user.walletBalance.toFixed(2)}. Please deposit more funds.`);
+    }
+    
+    // Process purchase
+    user.walletBalance -= script.price;
+    
+    const purchaseDate = new Date();
+    const expiryDate = new Date();
+    expiryDate.setMonth(expiryDate.getMonth() + 1);
+    
+    user.purchases.push({
+      scriptType: script.name,
+      purchaseDate,
+      expiryDate,
+      vpsLogin: '',
+      price: script.price
+    });
+    
+    await user.save();
+    
+    // Notify admin
+    bot.telegram.sendMessage(ADMIN_CHAT_ID, 
+      `🔔 *New Purchase Alert*\n\nUser: @${user.username || 'Unknown'} (ID: ${user.userId})\nScript: ${script.name}\nAmount: $${script.price}\nDate: ${purchaseDate.toLocaleString()}\n\nPlease send VPS login details using /sendvps ${user.userId} command.`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.answerCbQuery('Purchase successful!');
+    await ctx.reply(`✅ You have successfully purchased ${script.name}!\n\nYour purchase will be active until ${expiryDate.toLocaleDateString()}.\n\nThe admin will send you VPS login details shortly. Thank you for your purchase!`);
+  } catch (error) {
+    console.error('Error in purchase:', error);
+    await ctx.answerCbQuery('An error occurred.');
+    await ctx.reply('An error occurred during purchase. Please try again later.');
+  }
+});
+
+// Deposit handler
+bot.hears('💵 Deposit USDT', async (ctx) => {
+  const walletAddress = process.env.USDT_WALLET_ADDRESS;
+  const network = process.env.USDT_NETWORK || 'TRC20';
+  
+  await ctx.reply(`To deposit USDT, please send the desired amount to the following ${network} wallet address:\n\n\`${walletAddress}\`\n\n*IMPORTANT: Make sure to send USDT on the ${network} network only!*\n\nAfter sending, click the button below to notify the admin about your deposit.`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      Markup.button.callback('I have sent the payment', 'notify_deposit')
+    ])
+  });
+});
+
+// Notify deposit
+bot.action('notify_deposit', async (ctx) => {
+  await ctx.reply('Please enter the amount you deposited in USDT and the transaction ID in this format:\n\n*amount txid*\n\nExample: `100 TRC20123456789ABCDEF`', {
+    parse_mode: 'Markdown'
+  });
+  
+  if (!ctx.session) ctx.session = {};
+  ctx.session.awaitingDepositInfo = true;
+  await ctx.answerCbQuery();
+});
+
+// Handle deposit info (continued)
+bot.on('text', async (ctx, next) => {
+  if (ctx.session && ctx.session.awaitingDepositInfo) {
+    const parts = ctx.message.text.trim().split(' ');
+    
+    if (parts.length < 2) {
+      return ctx.reply('Please provide both the amount and transaction ID in the format: amount txid');
+    }
+    
+    const amount = parseFloat(parts[0]);
+    if (isNaN(amount) || amount <= 0) {
+      return ctx.reply('Please enter a valid amount.');
+    }
+    
+    const txid = parts.slice(1).join(' ');
+    if (!txid || txid.length < 5) {
+      return ctx.reply('Please enter a valid transaction ID.');
+    }
+    
+    try {
+      const user = await User.findOne({ userId: ctx.from.id });
+      if (!user) {
+        return ctx.reply('Your account was not found. Please use /start to register.');
+      }
+      
+      // Add pending deposit
+      user.pendingDeposits.push({
+        amount,
+        txid,
+        timestamp: new Date(),
+        confirmed: false
+      });
+      
+      await user.save();
+      
+      // Notify admin
+      bot.telegram.sendMessage(ADMIN_CHAT_ID, 
+        `💰 *New Deposit Notification*\n\nUser: @${user.username || 'Unknown'} (ID: ${user.userId})\nAmount: $${amount}\nTXID: ${txid}\nDate: ${new Date().toLocaleString()}\n\nUse /confirmdeposit ${user.userId} ${amount} to confirm this deposit.`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      ctx.session.awaitingDepositInfo = false;
+      await ctx.reply('Thank you! Your deposit notification has been sent to the admin. Once confirmed, the amount will be added to your balance.');
+    } catch (error) {
+      console.error('Error processing deposit info:', error);
+      await ctx.reply('An error occurred. Please try again later.');
+    }
+  } else {
+    return next();
+  }
+});
+bot.action(/page_(.+)/, async (ctx) => {
+  try {
+    const pageId = ctx.match[1];
+
+    // Debugging: Log the received pageId
+    console.log(`Received pageId: ${pageId}`);
+
+    // Check if pageId is a valid ObjectId
+    if (!mongoose.Types.ObjectId.isValid(pageId)) {
+      await ctx.answerCbQuery('Invalid page ID.');
+      return ctx.reply('Invalid page ID. Please try again.');
+    }
+
+    // Find the page in the database
+    const page = await Page.findById(pageId);
+    
+    if (!page) {
+      await ctx.answerCbQuery('Page not found.');
+      return ctx.reply('This page is not available.');
+    }
+
+    if (!page.active) {
+      await ctx.answerCbQuery('Page is not active.');
+      return ctx.reply('This page is currently not available for purchase.');
+    }
+
+    const user = await User.findOne({ userId: ctx.from.id });
+    if (!user) {
+      await ctx.answerCbQuery('Account not found.');
+      return ctx.reply('Your account was not found. Please use /start to register.');
+    }
+
+    if (user.walletBalance < page.price) {
+      await ctx.answerCbQuery('Insufficient balance.');
+      return ctx.reply(`Insufficient balance. You need $${page.price.toFixed(2)} to purchase ${page.name}. Your current balance is $${user.walletBalance.toFixed(2)}. Please deposit more funds.`);
+    }
+
+    // Process purchase
+    user.walletBalance -= page.price;
+
+    user.pagePurchases.push({
+      pageId: page._id,
+      name: page.name,
+      purchaseDate: new Date(),
+      accessDetails: '',
+      delivered: false
+    });
+
+    await user.save();
+
+    // Notify admin
+    bot.telegram.sendMessage(ADMIN_CHAT_ID, 
+      `📄 *New Page Purchase*\n\nUser: @${user.username || 'Unknown'} (ID: ${user.userId})\nPage: ${page.name}\nAmount: $${page.price}\nDate: ${new Date().toLocaleString()}\n\nPlease send page details using /sendpage ${user.userId} command.`,
+      { parse_mode: 'Markdown' }
+    );
+
+    await ctx.answerCbQuery('Purchase successful!');
+    await ctx.reply(`✅ You have successfully purchased ${page.name}!\n\nThe admin will send you the page details shortly. Thank you for your purchase!`);
+  } catch (error) {
+    console.error('Error in page purchase:', error);
+    await ctx.answerCbQuery('An error occurred.');
+    await ctx.reply('An error occurred during purchase. Please try again later.');
+  }
+});
+// Cookie Links submenu
+bot.hears('🍪 Cookie Links', async (ctx) => {
+  try {
+    const cookieLinks = await CookieLink.find({ active: true });
+    
+    if (cookieLinks.length === 0) {
+      return ctx.reply('No cookie links available at the moment. Please check back later.');
+    }
+    
+    const keyboard = Markup.inlineKeyboard(
+      cookieLinks.map(cookie => [
+        Markup.button.callback(`${cookie.name} - $${cookie.price}`, `cookie_${cookie._id}`)
+      ])
+    );
+    
+    await ctx.reply('Select a cookie link to purchase:', keyboard);
+  } catch (error) {
+    console.error('Error fetching cookie links:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// SMTP Servers submenu
+bot.hears('📧 SMTP Servers', async (ctx) => {
+  try {
+    const smtpServers = await SmtpServer.find({ active: true, pcsRemaining: { $gt: 0 } });
+    
+    if (smtpServers.length === 0) {
+      return ctx.reply('No SMTP servers available at the moment. Please check back later.');
+    }
+    
+    const keyboard = Markup.inlineKeyboard(
+      smtpServers.map(smtp => [
+        Markup.button.callback(`${smtp.name} - $${smtp.price} (${smtp.pcsRemaining} left)`, `smtp_${smtp._id}`)
+      ])
+    );
+    
+    await ctx.reply('Select an SMTP server to purchase:', keyboard);
+  } catch (error) {
+    console.error('Error fetching SMTP servers:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+bot.hears('📄 S.page', async (ctx) => {
+  try {
+    const pages = await Page.find({ active: true });
+    
+    if (pages.length === 0) {
+      return ctx.reply('No pages available at the moment. Please check back later.');
+    }
+    
+    const keyboard = Markup.inlineKeyboard(
+      pages.map(page => [
+        Markup.button.callback(`${page.name} - $${page.price}`, `page_${page._id}`)
+      ])
+    );
+    
+    await ctx.reply('Select a page to purchase:', keyboard);
+  } catch (error) {
+    console.error('Error fetching pages:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Handle cookie link purchase
+bot.action(/cookie_(.+)/, async (ctx) => {
+  try {
+    const cookieId = ctx.match[1];
+    const cookie = await CookieLink.findById(cookieId);
+    
+    if (!cookie || !cookie.active) {
+      await ctx.answerCbQuery('Cookie link not found or no longer available.');
+      return ctx.reply('This cookie link is not available.');
+    }
+    
+    const user = await User.findOne({ userId: ctx.from.id });
+    if (!user) {
+      await ctx.answerCbQuery('Account not found.');
+      return ctx.reply('Your account was not found. Please use /start to register.');
+    }
+    
+    if (user.walletBalance < cookie.price) {
+      await ctx.answerCbQuery('Insufficient balance.');
+      return ctx.reply(`Insufficient balance. You need $${cookie.price.toFixed(2)} to purchase ${cookie.name}. Your current balance is $${user.walletBalance.toFixed(2)}. Please deposit more funds.`);
+    }
+    
+    // Process purchase
+    user.walletBalance -= cookie.price;
+    
+    user.cookiePurchases.push({
+      cookieId: cookie._id,
+      name: cookie.name,
+      purchaseDate: new Date(),
+      accessDetails: '',
+      delivered: false
+    });
+    
+    await user.save();
+    
+    // Notify admin
+    bot.telegram.sendMessage(ADMIN_CHAT_ID, 
+      `🍪 *New Cookie Link Purchase*\n\nUser: @${user.username || 'Unknown'} (ID: ${user.userId})\nCookie: ${cookie.name}\nAmount: $${cookie.price}\nDate: ${new Date().toLocaleString()}\n\nPlease send cookie link details using /sendcookie ${user.userId} command.`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.answerCbQuery('Purchase successful!');
+    await ctx.reply(`✅ You have successfully purchased ${cookie.name}!\n\nThe admin will send you the cookie link details shortly. Thank you for your purchase!`);
+  } catch (error) {
+    console.error('Error in cookie purchase:', error);
+    await ctx.answerCbQuery('An error occurred.');
+    await ctx.reply('An error occurred during purchase. Please try again later.');
+  }
+});
+
+// Handle SMTP server purchase
+bot.action(/smtp_(.+)/, async (ctx) => {
+  try {
+    const smtpId = ctx.match[1];
+    const smtp = await SmtpServer.findById(smtpId);
+    
+    if (!smtp || !smtp.active || smtp.pcsRemaining <= 0) {
+      await ctx.answerCbQuery('SMTP server not found or no longer available.');
+      return ctx.reply('This SMTP server is not available.');
+    }
+    
+    const user = await User.findOne({ userId: ctx.from.id });
+    if (!user) {
+      await ctx.answerCbQuery('Account not found.');
+      return ctx.reply('Your account was not found. Please use /start to register.');
+    }
+    
+    if (user.walletBalance < smtp.price) {
+      await ctx.answerCbQuery('Insufficient balance.');
+      return ctx.reply(`Insufficient balance. You need $${smtp.price.toFixed(2)} to purchase ${smtp.name}. Your current balance is $${user.walletBalance.toFixed(2)}. Please deposit more funds.`);
+    }
+    
+    // Process purchase
+    user.walletBalance -= smtp.price;
+    
+    user.smtpPurchases.push({
+      smtpId: smtp._id,
+      name: smtp.name,
+      purchaseDate: new Date(),
+      details: '',
+      delivered: false
+    });
+    
+    // Decrease available quantity
+    smtp.pcsRemaining -= 1;
+    await smtp.save();
+    
+    await user.save();
+    
+    // Notify admin
+    bot.telegram.sendMessage(ADMIN_CHAT_ID, 
+      `📧 *New SMTP Server Purchase*\n\nUser: @${user.username || 'Unknown'} (ID: ${user.userId})\nSMTP: ${smtp.name}\nAmount: $${smtp.price}\nDate: ${new Date().toLocaleString()}\n\nPlease send SMTP details using /sendsmtp ${user.userId} command.`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.answerCbQuery('Purchase successful!');
+    await ctx.reply(`✅ You have successfully purchased ${smtp.name}!\n\nThe admin will send you the SMTP server details shortly. Thank you for your purchase!`);
+  } catch (error) {
+    console.error('Error in SMTP purchase:', error);
+    await ctx.answerCbQuery('An error occurred.');
+    await ctx.reply('An error occurred during purchase. Please try again later.');
+  }
+});
+
+// Admin: Confirm deposit
+bot.command('confirmdeposit', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length < 2) {
+    return ctx.reply('Usage: /confirmdeposit userId amount');
+  }
+  
+  const userId = parseInt(args[0]);
+  const amount = parseFloat(args[1]);
+  
+  if (isNaN(userId) || isNaN(amount) || amount <= 0) {
+    return ctx.reply('Please provide valid userId and amount.');
+  }
+  
+  try {
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return ctx.reply('User not found.');
+    }
+    
+    // Find the pending deposit with the closest amount
+    const pendingDeposit = user.pendingDeposits.find(d => !d.confirmed && Math.abs(d.amount - amount) < 0.01);
+    
+    if (!pendingDeposit) {
+      return ctx.reply(`No pending deposit found for user ${userId} with amount $${amount}.`);
+    }
+    
+    // Confirm deposit
+    pendingDeposit.confirmed = true;
+    user.walletBalance += amount;
+    await user.save();
+    
+    // Notify user
+    bot.telegram.sendMessage(userId, 
+      `💰 *Deposit Confirmed*\n\nYour deposit of $${amount} has been confirmed and added to your balance.\nNew balance: $${user.walletBalance.toFixed(2)}`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.reply(`Deposit of $${amount} for user ${userId} has been confirmed. Their new balance is $${user.walletBalance.toFixed(2)}.`);
+  } catch (error) {
+    console.error('Error confirming deposit:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Send VPS login details
+bot.command('sendvps', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('Usage: /sendvps userId vpsLoginDetails');
+  }
+  
+  const userId = parseInt(parts[1]);
+  const vpsLogin = parts.slice(2).join(' ');
+  
+  try {
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return ctx.reply('User not found.');
+    }
+    
+    // Find the most recent purchase without VPS login
+    const purchase = user.purchases.slice().reverse().find(p => !p.vpsLogin);
+    
+    if (!purchase) {
+      return ctx.reply(`No pending script purchase found for user ${userId}.`);
+    }
+    
+    // Update purchase with VPS login
+    purchase.vpsLogin = vpsLogin;
+    await user.save();
+    
+    // Notify user
+    bot.telegram.sendMessage(userId, 
+      `🔐 *VPS Login Details*\n\nYour login details for ${purchase.scriptType} are ready:\n\n${vpsLogin}\n\nThank you for your purchase!`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.reply(`VPS login details for ${purchase.scriptType} have been sent to user ${userId}.`);
+  } catch (error) {
+    console.error('Error sending VPS details:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Send cookie link details
+bot.command('sendcookie', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('Usage: /sendcookie userId cookieDetails');
+  }
+  
+  const userId = parseInt(parts[1]);
+  const cookieDetails = parts.slice(2).join(' ');
+  
+  try {
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return ctx.reply('User not found.');
+    }
+    
+    // Find the most recent cookie purchase that hasn't been delivered
+    const purchase = user.cookiePurchases.slice().reverse().find(p => !p.delivered);
+    
+    if (!purchase) {
+      return ctx.reply(`No pending cookie purchase found for user ${userId}.`);
+    }
+    
+    // Update purchase with cookie details
+    purchase.accessDetails = cookieDetails;
+    purchase.delivered = true;
+    await user.save();
+    
+    // Notify user
+    bot.telegram.sendMessage(userId, 
+      `🍪 *Cookie Link Details*\n\nYour cookie link details for ${purchase.name} are ready:\n\n${cookieDetails}\n\nThank you for your purchase!`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.reply(`Cookie link details for ${purchase.name} have been sent to user ${userId}.`);
+  } catch (error) {
+    console.error('Error sending cookie details:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Send SMTP server details
+bot.command('sendsmtp', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('Usage: /sendsmtp userId smtpDetails');
+  }
+  
+  const userId = parseInt(parts[1]);
+  const smtpDetails = parts.slice(2).join(' ');
+  
+  try {
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return ctx.reply('User not found.');
+    }
+    
+    // Find the most recent SMTP purchase that hasn't been delivered
+    const purchase = user.smtpPurchases.slice().reverse().find(p => !p.delivered);
+    
+    if (!purchase) {
+      return ctx.reply(`No pending SMTP purchase found for user ${userId}.`);
+    }
+    
+    // Update purchase with SMTP details
+    purchase.details = smtpDetails;
+    purchase.delivered = true;
+    await user.save();
+    
+    // Notify user
+    bot.telegram.sendMessage(userId, 
+      `📧 *SMTP Server Details*\n\nYour SMTP server details for ${purchase.name} are ready:\n\n${smtpDetails}\n\nThank you for your purchase!`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.reply(`SMTP server details for ${purchase.name} have been sent to user ${userId}.`);
+  } catch (error) {
+    console.error('Error sending SMTP details:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+bot.command('sendpage', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('Usage: /sendpage userId pageDetails');
+  }
+  
+  const userId = parseInt(parts[1]);
+  const pageDetails = parts.slice(2).join(' ');
+  
+  try {
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return ctx.reply('User not found.');
+    }
+    
+    // Find the most recent page purchase that hasn't been delivered
+    const purchase = user.pagePurchases.slice().reverse().find(p => !p.delivered);
+    
+    if (!purchase) {
+      return ctx.reply(`No pending page purchase found for user ${userId}.`);
+    }
+    
+    // Update purchase with page details
+    purchase.accessDetails = pageDetails;
+    purchase.delivered = true;
+    await user.save();
+    
+    // Notify user
+    bot.telegram.sendMessage(userId, 
+      `📄 *Page Details*\n\nYour page details for ${purchase.name} are ready:\n\n${pageDetails}\n\nThank you for your purchase!`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.reply(`Page details for ${purchase.name} have been sent to user ${userId}.`);
+  } catch (error) {
+    console.error('Error sending page details:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+bot.hears('📄 Manage Pages', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('Add New Page', 'add_page')],
+    [Markup.button.callback('View/Edit Pages', 'view_pages')]
+  ]);
+  
+  await ctx.reply('Page Management:', keyboard);
+});
+
+bot.action('add_page', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  await ctx.answerCbQuery();
+  await ctx.reply('Please enter the page details in this format:\n\n*name|price|description*\n\nExample: `Landing Page|50|High-converting landing page for marketing`', {
+    parse_mode: 'Markdown'
+  });
+  
+  if (!ctx.session) ctx.session = {};
+  ctx.session.awaitingPageDetails = true;
+});
+
+bot.on('text', async (ctx, next) => {
+  if (ctx.session && ctx.session.awaitingPageDetails) {
+    if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+      ctx.session.awaitingPageDetails = false;
+      return next();
+    }
+    
+    const parts = ctx.message.text.split('|');
+    if (parts.length < 3) {
+      return ctx.reply('Please provide name, price, and description separated by | character.');
+    }
+    
+    const name = parts[0].trim();
+    const price = parseFloat(parts[1].trim());
+    const description = parts[2].trim();
+    
+    if (!name || isNaN(price) || price <= 0) {
+      return ctx.reply('Please provide a valid name and price.');
+    }
+    
+    try {
+      const newPage = new Page({
+        name,
+        price,
+        description,
+        active: true
+      });
+      
+      await newPage.save();
+      
+      ctx.session.awaitingPageDetails = false;
+      await ctx.reply(`✅ Page "${name}" has been added successfully with price $${price}.`);
+    } catch (error) {
+      console.error('Error adding page:', error);
+      await ctx.reply('An error occurred. Please try again later.');
+    }
+  } else {
+    return next();
+  }
+});
+
+bot.action('view_pages', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    const pages = await Page.find();
+    
+    if (pages.length === 0) {
+      await ctx.answerCbQuery('No pages found');
+      return ctx.reply('No pages found in the database.');
+    }
+    
+    await ctx.answerCbQuery();
+    
+    let message = '📄 *Available Pages*\n\n';
+    pages.forEach((page, index) => {
+      message += `${index + 1}. ${page.name}\n`;
+      message += `   Price: $${page.price}\n`;
+      message += `   Description: ${page.description || 'N/A'}\n`;
+      message += `   Status: ${page.active ? 'Active' : 'Inactive'}\n`;
+      message += `   ID: ${page._id}\n\n`;
+    });
+    
+    message += 'To edit a page, use:\n/editpage id name|price|description|active\n\nTo delete a page, use:\n/deletepage id';
+    
+    await ctx.replyWithMarkdown(message);
+  } catch (error) {
+    console.error('Error fetching pages:', error);
+    await ctx.answerCbQuery('An error occurred');
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+bot.command('editpage', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('Usage: /editpage id name|price|description|active');
+  }
+  
+  const pageId = parts[1];
+  const details = parts.slice(2).join(' ').split('|');
+  
+  if (details.length < 4) {
+    return ctx.reply('Please provide name, price, description, and active status (true/false) separated by | character.');
+  }
+  
+  const name = details[0].trim();
+  const price = parseFloat(details[1].trim());
+  const description = details[2].trim();
+  const active = details[3].trim().toLowerCase() === 'true';
+  
+  if (!name || isNaN(price) || price <= 0) {
+    return ctx.reply('Please provide valid name and price.');
+  }
+  
+  try {
+    const page = await Page.findById(pageId);
+    if (!page) {
+      return ctx.reply('Page not found.');
+    }
+    
+    page.name = name;
+    page.price = price;
+    page.description = description;
+    page.active = active;
+    
+    await page.save();
+    
+    await ctx.reply(`✅ Page "${name}" has been updated successfully.`);
+  } catch (error) {
+    console.error('Error updating page:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+bot.command('deletepage', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 2) {
+    return ctx.reply('Usage: /deletepage id');
+  }
+  
+  const pageId = parts[1];
+  
+  try {
+    const result = await Page.findByIdAndDelete(pageId);
+    if (!result) {
+      return ctx.reply('Page not found.');
+    }
+    
+    await ctx.reply(`✅ Page "${result.name}" has been deleted successfully.`);
+  } catch (error) {
+    console.error('Error deleting page:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+
+
+// Admin: View pending deliveries
+bot.hears('📤 Pending Deliveries', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  try {
+    // Find users with pending deliveries
+    const users = await User.find({
+      $or: [
+        { 'purchases.vpsLogin': { $in: ['', null] } },
+        { 'cookiePurchases.delivered': false },
+        { 'smtpPurchases.delivered': false },
+        { 'pagePurchases.delivered': false }
+      ]
+    });
+    
+    if (users.length === 0) {
+      return ctx.reply('No pending deliveries found.');
+    }
+    
+    let message = '📤 *Pending Deliveries*\n\n';
+    
+    for (const user of users) {
+      // Check for pending script deliveries
+      const pendingScripts = user.purchases.filter(p => !p.vpsLogin);
+      if (pendingScripts.length > 0) {
+        message += `👤 User: @${user.username || 'Unknown'} (ID: ${user.userId})\n`;
+        message += `*Pending Scripts:*\n`;
+        pendingScripts.forEach((script, index) => {
+          message += `${index + 1}. ${script.scriptType} (purchased: ${new Date(script.purchaseDate).toLocaleDateString()})\n`;
+        });
+        message += `Send VPS details with: /sendvps ${user.userId} details\n\n`;
+      }
+      
+      // Check for pending cookie deliveries
+      const pendingCookies = user.cookiePurchases.filter(p => !p.delivered);
+      if (pendingCookies.length > 0) {
+        if (pendingScripts.length === 0) {
+          message += `👤 User: @${user.username || 'Unknown'} (ID: ${user.userId})\n`;
+        }
+        message += `*Pending Cookie Links:*\n`;
+        pendingCookies.forEach((cookie, index) => {
+          message += `${index + 1}. ${cookie.name} (purchased: ${new Date(cookie.purchaseDate).toLocaleDateString()})\n`;
+        });
+        message += `Send cookie details with: /sendcookie ${user.userId} details\n\n`;
+      }
+      
+      // Check for pending SMTP deliveries
+      const pendingSmtps = user.smtpPurchases.filter(p => !p.delivered);
+      if (pendingSmtps.length > 0) {
+        if (pendingScripts.length === 0 && pendingCookies.length === 0) {
+          message += `👤 User: @${user.username || 'Unknown'} (ID: ${user.userId})\n`;
+        }
+        message += `*Pending SMTP Servers:*\n`;
+        pendingSmtps.forEach((smtp, index) => {
+          message += `${index + 1}. ${smtp.name} (purchased: ${new Date(smtp.purchaseDate).toLocaleDateString()})\n`;
+        });
+        message += `Send SMTP details with: /sendsmtp ${user.userId} details\n\n`;
+      }
+      
+      // Check for pending page deliveries
+      const pendingPages = user.pagePurchases.filter(p => !p.delivered);
+      if (pendingPages.length > 0) {
+        if (pendingScripts.length === 0 && pendingCookies.length === 0 && pendingSmtps.length === 0) {
+          message += `👤 User: @${user.username || 'Unknown'} (ID: ${user.userId})\n`;
+        }
+        message += `*Pending Pages:*\n`;
+        pendingPages.forEach((page, index) => {
+          message += `${index + 1}. ${page.name} (purchased: ${new Date(page.purchaseDate).toLocaleDateString()})\n`;
+        });
+        message += `Send page details with: /sendpage ${user.userId} details\n\n`;
+      }
+    }
+    
+    // Split message if too long
+    if (message.length > 4000) {
+      const parts = message.match(/.{1,4000}/g);
+      for (const part of parts) {
+        await ctx.replyWithMarkdown(part);
+      }
+    } else {
+      await ctx.replyWithMarkdown(message);
+    }
+  } catch (error) {
+    console.error('Error fetching pending deliveries:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Manage Cookies
+bot.hears('🍪 Manage Cookies', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('Add New Cookie Link', 'add_cookie')],
+    [Markup.button.callback('View/Edit Cookie Links', 'view_cookies')]
+  ]);
+  
+  await ctx.reply('Cookie Link Management:', keyboard);
+});
+
+// Admin: Manage SMTPs
+bot.hears('📧 Manage SMTPs', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('Add New SMTP Server', 'add_smtp')],
+    [Markup.button.callback('View/Edit SMTP Servers', 'view_smtps')]
+  ]);
+  
+  await ctx.reply('SMTP Server Management:', keyboard);
+});
+
+// Admin: Add new cookie link
+bot.action('add_cookie', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  await ctx.answerCbQuery();
+  await ctx.reply('Please enter the cookie link details in this format:\n\n*name|price|description|previewLink*\n\nExample: `Gmail Cookies|25|Fresh Gmail cookies for inbox spamming|https://example.com/preview`', {
+    parse_mode: 'Markdown'
+  });
+  
+  if (!ctx.session) ctx.session = {};
+  ctx.session.awaitingCookieDetails = true;
+});
+
+// Admin: Add new SMTP server
+bot.action('add_smtp', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  await ctx.answerCbQuery();
+  await ctx.reply('Please enter the SMTP server details in this format:\n\n*name|price|quantity|description*\n\nExample: `Gmail SMTP|30|5|High-deliverability Gmail SMTP servers`', {
+    parse_mode: 'Markdown'
+  });
+  
+  if (!ctx.session) ctx.session = {};
+  ctx.session.awaitingSmtpDetails = true;
+});
+
+// Admin: View cookie links
+bot.action('view_cookies', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    const cookies = await CookieLink.find();
+    
+    if (cookies.length === 0) {
+      await ctx.answerCbQuery('No cookie links found');
+      return ctx.reply('No cookie links found in the database.');
+    }
+    
+    await ctx.answerCbQuery();
+    
+    let message = '🍪 *Available Cookie Links*\n\n';
+    cookies.forEach((cookie, index) => {
+      message += `${index + 1}. ${cookie.name}\n`;
+      message += `   Price: $${cookie.price}\n`;
+      message += `   Description: ${cookie.description || 'N/A'}\n`;
+      message += `   Status: ${cookie.active ? 'Active' : 'Inactive'}\n`;
+      message += `   ID: ${cookie._id}\n\n`;
+    });
+    
+    message += 'To edit a cookie link, use:\n/editcookie id name|price|description|active\n\nTo delete a cookie link, use:\n/deletecookie id';
+    
+    await ctx.replyWithMarkdown(message);
+  } catch (error) {
+    console.error('Error fetching cookie links:', error);
+    await ctx.answerCbQuery('An error occurred');
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: View SMTP servers
+bot.action('view_smtps', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    const smtps = await SmtpServer.find();
+    
+    if (smtps.length === 0) {
+      await ctx.answerCbQuery('No SMTP servers found');
+      return ctx.reply('No SMTP servers found in the database.');
+    }
+    
+    await ctx.answerCbQuery();
+    
+    let message = '📧 *Available SMTP Servers*\n\n';
+    smtps.forEach((smtp, index) => {
+      message += `${index + 1}. ${smtp.name}\n`;
+      message += `   Price: $${smtp.price}\n`;
+      message += `   Remaining: ${smtp.pcsRemaining}\n`;
+      message += `   Description: ${smtp.description || 'N/A'}\n`;
+      message += `   Status: ${smtp.active ? 'Active' : 'Inactive'}\n`;
+      message += `   ID: ${smtp._id}\n\n`;
+    });
+    
+    message += 'To edit an SMTP server, use:\n/editsmtp id name|price|quantity|description|active\n\nTo delete an SMTP server, use:\n/deletesmtp id';
+    
+    await ctx.replyWithMarkdown(message);
+  } catch (error) {
+    console.error('Error fetching SMTP servers:', error);
+    await ctx.answerCbQuery('An error occurred');
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Handle cookie details input
+bot.on('text', async (ctx, next) => {
+  if (ctx.session && ctx.session.awaitingCookieDetails) {
+    if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+      ctx.session.awaitingCookieDetails = false;
+      return next();
+    }
+    
+    const parts = ctx.message.text.split('|');
+    if (parts.length < 3) {
+      return ctx.reply('Please provide at least name, price, and description separated by | character.');
+    }
+    
+    const name = parts[0].trim();
+    const price = parseFloat(parts[1].trim());
+    const description = parts[2].trim();
+    const previewLink = parts[3] ? parts[3].trim() : '';
+    
+    if (!name || isNaN(price) || price <= 0) {
+      return ctx.reply('Please provide a valid name and price.');
+    }
+    
+    try {
+      const newCookie = new CookieLink({
+        name,
+        price,
+        description,
+        previewLink,
+        active: true
+      });
+      
+      await newCookie.save();
+      
+      ctx.session.awaitingCookieDetails = false;
+      await ctx.reply(`✅ Cookie link "${name}" has been added successfully with price $${price}.`);
+    } catch (error) {
+      console.error('Error adding cookie link:', error);
+      await ctx.reply('An error occurred. Please try again later.');
+    }
+  } else if (ctx.session && ctx.session.awaitingSmtpDetails) {
+    if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+      ctx.session.awaitingSmtpDetails = false;
+      return next();
+    }
+    
+    const parts = ctx.message.text.split('|');
+    if (parts.length < 4) {
+      return ctx.reply('Please provide name, price, quantity, and description separated by | character.');
+    }
+    
+    const name = parts[0].trim();
+    const price = parseFloat(parts[1].trim());
+    const quantity = parseInt(parts[2].trim());
+    const description = parts[3].trim();
+    
+    if (!name || isNaN(price) || price <= 0 || isNaN(quantity) || quantity <= 0) {
+      return ctx.reply('Please provide valid name, price, and quantity.');
+    }
+    
+    try {
+      const newSmtp = new SmtpServer({
+        name,
+        price,
+        pcsRemaining: quantity,
+        description,
+        active: true
+      });
+      
+      await newSmtp.save();
+      
+      ctx.session.awaitingSmtpDetails = false;
+      await ctx.reply(`✅ SMTP server "${name}" has been added successfully with price $${price} and quantity ${quantity}.`);
+    } catch (error) {
+      console.error('Error adding SMTP server:', error);
+      await ctx.reply('An error occurred. Please try again later.');
+    }
+  } else {
+    return next();
+  }
+});
+
+// Admin: Edit cookie link
+bot.command('editcookie', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('Usage: /editcookie id name|price|description|active');
+  }
+  
+  const cookieId = parts[1];
+  const details = parts.slice(2).join(' ').split('|');
+  
+  if (details.length < 4) {
+    return ctx.reply('Please provide name, price, description, and active status (true/false) separated by | character.');
+  }
+  
+  const name = details[0].trim();
+  const price = parseFloat(details[1].trim());
+  const description = details[2].trim();
+  const active = details[3].trim().toLowerCase() === 'true';
+  
+  if (!name || isNaN(price) || price <= 0) {
+    return ctx.reply('Please provide valid name and price.');
+  }
+  
+  try {
+    const cookie = await CookieLink.findById(cookieId);
+    if (!cookie) {
+      return ctx.reply('Cookie link not found.');
+    }
+    
+    cookie.name = name;
+    cookie.price = price;
+    cookie.description = description;
+    cookie.active = active;
+    
+    await cookie.save();
+    
+    await ctx.reply(`✅ Cookie link "${name}" has been updated successfully.`);
+  } catch (error) {
+    console.error('Error updating cookie link:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Edit SMTP server
+bot.command('editsmtp', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('Usage: /editsmtp id name|price|quantity|description|active');
+  }
+  
+  const smtpId = parts[1];
+  const details = parts.slice(2).join(' ').split('|');
+  
+  if (details.length < 5) {
+    return ctx.reply('Please provide name, price, quantity, description, and active status (true/false) separated by | character.');
+  }
+  
+  const name = details[0].trim();
+  const price = parseFloat(details[1].trim());
+  const quantity = parseInt(details[2].trim());
+  const description = details[3].trim();
+  const active = details[4].trim().toLowerCase() === 'true';
+  
+  if (!name || isNaN(price) || price <= 0 || isNaN(quantity) || quantity < 0) {
+    return ctx.reply('Please provide valid name, price, and quantity.');
+  }
+  
+  try {
+    const smtp = await SmtpServer.findById(smtpId);
+    if (!smtp) {
+      return ctx.reply('SMTP server not found.');
+    }
+    
+    smtp.name = name;
+    smtp.price = price;
+    smtp.pcsRemaining = quantity;
+    smtp.description = description;
+    smtp.active = active;
+    
+    await smtp.save();
+    
+    await ctx.reply(`✅ SMTP server "${name}" has been updated successfully.`);
+  } catch (error) {
+    console.error('Error updating SMTP server:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Delete cookie link
+bot.command('deletecookie', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 2) {
+    return ctx.reply('Usage: /deletecookie id');
+  }
+  
+  const cookieId = parts[1];
+  
+  try {
+    const result = await CookieLink.findByIdAndDelete(cookieId);
+    if (!result) {
+      return ctx.reply('Cookie link not found.');
+    }
+    
+    await ctx.reply(`✅ Cookie link "${result.name}" has been deleted successfully.`);
+  } catch (error) {
+    console.error('Error deleting cookie link:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Delete SMTP server
+bot.command('deletesmtp', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 2) {
+    return ctx.reply('Usage: /deletesmtp id');
+  }
+  
+  const smtpId = parts[1];
+  
+  try {
+    const result = await SmtpServer.findByIdAndDelete(smtpId);
+    if (!result) {
+      return ctx.reply('SMTP server not found.');
+    }
+    
+    await ctx.reply(`✅ SMTP server "${result.name}" has been deleted successfully.`);
+  } catch (error) {
+    console.error('Error deleting SMTP server:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: View users
+// Admin: View users
+// Global variable to store users for pagination
+let cachedUsers = null;
+
+// Admin: View users
+bot.hears('👥 View Users', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  try {
+    console.log('View Users command triggered');
+    // Fetch all users and cache them
+    cachedUsers = await User.find().sort({ registrationDate: -1 });
+    
+    if (cachedUsers.length === 0) {
+      return ctx.reply('No users found.');
+    }
+    
+    // Create user chunks to paginate results
+    const USERS_PER_PAGE = 10;
+    const totalPages = Math.ceil(cachedUsers.length / 10);
+    console.log(`Total users: ${cachedUsers.length}, total pages: ${totalPages}`);
+    
+    // Send first page by default
+    await displayUserPage(ctx, 1, totalPages);
+    
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Function to display a specific page from cached users
+async function displayUserPage(ctx, page, totalPages) {
+  if (!cachedUsers) {
+    return ctx.reply('No user data available. Please try again.');
+  }
+  
+  const USERS_PER_PAGE = 10;
+  const startIdx = (page - 1) * USERS_PER_PAGE;
+  const endIdx = Math.min(startIdx + USERS_PER_PAGE, cachedUsers.length);
+  const usersToShow = cachedUsers.slice(startIdx, endIdx);
+  
+  console.log(`Displaying user page ${page}/${totalPages} with ${usersToShow.length} users`);
+  
+  let message = `👥 *Registered Users (${cachedUsers.length} total)*\n`;
+  message += `*Page ${page}/${totalPages}*\n\n`;
+  
+  usersToShow.forEach((user, index) => {
+    const actualIndex = startIdx + index + 1;
+    message += `${actualIndex}. @${user.username || 'Unknown'} (ID: ${user.userId})\n`;
+    message += `   Balance: $${user.walletBalance.toFixed(2)}\n`;
+    message += `   Registered: ${new Date(user.registrationDate).toLocaleDateString()}\n`;
+    message += `   Purchases: ${user.purchases.length +
+      (user.cookiePurchases ? user.cookiePurchases.length : 0) +
+      (user.smtpPurchases ? user.smtpPurchases.length : 0)}\n\n`;
+  });
+  
+  // Simple numeric pagination
+  const keyboard = [];
+  const paginationRow = [];
+  
+  if (page > 1) {
+    paginationRow.push(Markup.button.callback('⬅️ Previous', `simple_prev`));
+  }
+  
+  paginationRow.push(Markup.button.callback(`${page}/${totalPages}`, 'current_page'));
+  
+  if (page < totalPages) {
+    paginationRow.push(Markup.button.callback('Next ➡️', `simple_next`));
+  }
+  
+  if (paginationRow.length > 0) {
+    keyboard.push(paginationRow);
+  }
+  
+  // Add a button to view user details
+  keyboard.push([Markup.button.callback('🔍 View User Details', 'view_user_details')]);
+  
+  await ctx.reply(message, Markup.inlineKeyboard(keyboard));
+}
+
+// Simple previous page handler
+bot.action('simple_prev', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    if (!cachedUsers) {
+      await ctx.answerCbQuery('No data available');
+      return ctx.reply('Session expired. Please run the View Users command again.');
+    }
+    
+    // Get current page from the message
+    const messageText = ctx.callbackQuery.message.text;
+    const pageMatch = messageText.match(/\*Page (\d+)\/(\d+)\*/);
+    
+    if (!pageMatch) {
+      await ctx.answerCbQuery('Cannot determine current page');
+      return;
+    }
+    
+    const currentPage = parseInt(pageMatch[1]);
+    const totalPages = parseInt(pageMatch[2]);
+    
+    if (currentPage <= 1) {
+      await ctx.answerCbQuery('Already on the first page');
+      return;
+    }
+    
+    const newPage = currentPage - 1;
+    console.log(`Moving to previous page: ${newPage}`);
+    
+    await ctx.answerCbQuery();
+    await ctx.deleteMessage();
+    await displayUserPage(ctx, newPage, totalPages);
+    
+  } catch (error) {
+    console.error('Error navigating to previous page:', error);
+    await ctx.answerCbQuery('An error occurred');
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Simple next page handler
+bot.action('simple_next', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    if (!cachedUsers) {
+      await ctx.answerCbQuery('No data available');
+      return ctx.reply('Session expired. Please run the View Users command again.');
+    }
+    
+    // Get current page from the message
+    const messageText = ctx.callbackQuery.message.text;
+    const pageMatch = messageText.match(/\*Page (\d+)\/(\d+)\*/);
+    
+    if (!pageMatch) {
+      await ctx.answerCbQuery('Cannot determine current page');
+      return;
+    }
+    
+    const currentPage = parseInt(pageMatch[1]);
+    const totalPages = parseInt(pageMatch[2]);
+    
+    if (currentPage >= totalPages) {
+      await ctx.answerCbQuery('Already on the last page');
+      return;
+    }
+    
+    const newPage = currentPage + 1;
+    console.log(`Moving to next page: ${newPage}`);
+    
+    await ctx.answerCbQuery();
+    await ctx.deleteMessage();
+    await displayUserPage(ctx, newPage, totalPages);
+    
+  } catch (error) {
+    console.error('Error navigating to next page:', error);
+    await ctx.answerCbQuery('An error occurred');
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Dummy handler for current page button
+bot.action('current_page', async (ctx) => {
+  await ctx.answerCbQuery('Current page');
+});
+
+
+// Helper function to send paginated user data
+// Helper function to send paginated user data
+// Updated sendUserPage function with explicit callback data
+async function sendUserPage(ctx, allUsers, page, totalPages) {
+  const USERS_PER_PAGE = 10;
+  const startIdx = (page - 1) * USERS_PER_PAGE;
+  const endIdx = Math.min(startIdx + USERS_PER_PAGE, allUsers.length);
+  const usersToShow = allUsers.slice(startIdx, endIdx);
+  
+  console.log(`Sending user page ${page}/${totalPages} with ${usersToShow.length} users`);
+  
+  let message = `👥 *Registered Users (${allUsers.length} total)*\n`;
+  message += `*Page ${page}/${totalPages}*\n\n`;
+  
+  usersToShow.forEach((user, index) => {
+    const actualIndex = startIdx + index + 1;
+    message += `${actualIndex}. @${user.username || 'Unknown'} (ID: ${user.userId})\n`;
+    message += `   Balance: $${user.walletBalance.toFixed(2)}\n`;
+    message += `   Registered: ${new Date(user.registrationDate).toLocaleDateString()}\n`;
+    message += `   Purchases: ${user.purchases.length +
+      (user.cookiePurchases ? user.cookiePurchases.length : 0) +
+      (user.smtpPurchases ? user.smtpPurchases.length : 0)}\n\n`;
+  });
+  
+  // Add pagination controls with explicit page numbers
+  const keyboard = [];
+  const paginationRow = [];
+  
+  if (page > 1) {
+    paginationRow.push(Markup.button.callback(`⬅️ Page ${page-1}`, `goto_page_${page-1}`));
+  }
+  
+  if (page < totalPages) {
+    paginationRow.push(Markup.button.callback(`Page ${page+1} ➡️`, `goto_page_${page+1}`));
+  }
+  
+  if (paginationRow.length > 0) {
+    keyboard.push(paginationRow);
+  }
+  
+  // Add a button to view user details
+  keyboard.push([Markup.button.callback('🔍 View User Details', 'view_user_details')]);
+  
+  await ctx.reply(message, Markup.inlineKeyboard(keyboard));
+}
+
+// New handler for the explicit pagination
+bot.action(/goto_page_(\d+)/, async (ctx) => {
+  console.log('New pagination callback triggered');
+  console.log('Callback data:', ctx.callbackQuery.data);
+  
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    const pageId = ctx.match[1];
+    console.log(`Received pageId: ${pageId}`);
+    const page = parseInt(pageId);
+    
+    if (isNaN(page)) {
+      console.log(`Invalid page number: ${pageId} (not a number)`);
+      await ctx.answerCbQuery('Invalid page number');
+      return;
+    }
+    
+    console.log(`Processing page request for page: ${page}`);
+    
+    // Fetch all users sorted by registration date
+    const users = await User.find().sort({ registrationDate: -1 });
+    const totalPages = Math.ceil(users.length / 10);
+    console.log(`Total pages: ${totalPages}, requested page: ${page}`);
+    
+    // Validate the page number
+    if (page < 1 || page > totalPages) {
+      console.log(`Invalid page number: ${page}. Total pages: ${totalPages}`);
+      await ctx.answerCbQuery('Invalid page number.');
+      return ctx.reply('Invalid page number. Please try again.');
+    }
+    
+    await ctx.answerCbQuery();
+    
+    // Try to delete the previous message, but handle errors gracefully
+    try {
+      await ctx.deleteMessage();
+      console.log('Previous message deleted successfully');
+    } catch (error) {
+      console.log('Could not delete previous message:', error.message);
+      // Continue anyway
+    }
+    
+    await sendUserPage(ctx, users, page, totalPages); // Send the new page
+    console.log(`Successfully sent page ${page}`);
+  } catch (error) {
+    console.error('Error with user pagination:', error);
+    await ctx.answerCbQuery('An error occurred');
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+
+// Handle pagination for users list
+// Handle pagination for users list
+// Handle pagination for users list
+bot.action(/users_page_(\d+)/, async (ctx) => {
+  console.log('Pagination callback triggered');
+  console.log('Callback data:', ctx.callbackQuery.data);
+  console.log('Match result:', ctx.match);
+  
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    console.log('Not admin, rejecting');
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    const page = parseInt(ctx.match[1]); // Extract the page number from the callback data
+    console.log(`Processing page request for page: ${page}`);
+    
+    // Fetch all users sorted by registration date
+    const users = await User.find().sort({ registrationDate: -1 });
+    const totalPages = Math.ceil(users.length / 10);
+    console.log(`Total pages: ${totalPages}, current page: ${page}`);
+    
+    // Validate the page number
+    if (page < 1 || page > totalPages) {
+      console.log(`Invalid page number: ${page}. Total pages: ${totalPages}`);
+      await ctx.answerCbQuery('Invalid page number.');
+      return ctx.reply('Invalid page number. Please try again.');
+    }
+    
+    await ctx.answerCbQuery();
+    
+    // Try to delete the previous message, but handle errors gracefully
+    try {
+      await ctx.deleteMessage();
+      console.log('Previous message deleted successfully');
+    } catch (error) {
+      console.log('Could not delete previous message:', error.message);
+      // Continue anyway
+    }
+    
+    await sendUserPage(ctx, users, page, totalPages); // Send the new page
+    console.log(`Successfully sent page ${page}`);
+  } catch (error) {
+    console.error('Error with user pagination:', error);
+    await ctx.answerCbQuery('An error occurred');
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+
+
+// Add a callback to view specific user details
+bot.action('view_user_details', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  await ctx.answerCbQuery();
+  await ctx.reply('Please enter the user ID you want to view:');
+  
+  if (!ctx.session) ctx.session = {};
+  ctx.session.awaitingUserId = true;
+});
+
+// Handle user ID input for viewing details
+bot.on('text', async (ctx, next) => {
+  if (ctx.session && ctx.session.awaitingUserId) {
+    if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+      ctx.session.awaitingUserId = false;
+      return next();
+    }
+    
+    const userId = parseInt(ctx.message.text.trim());
+    if (isNaN(userId)) {
+      await ctx.reply('Please enter a valid user ID (numbers only).');
+      return;
+    }
+    
+    try {
+      const user = await User.findOne({ userId });
+      if (!user) {
+        await ctx.reply(`User with ID ${userId} not found.`);
+        ctx.session.awaitingUserId = false;
+        return;
+      }
+      
+      let message = `👤 *User Details*\n\n`;
+      message += `ID: ${user.userId}\n`;
+      message += `Username: @${user.username || 'Unknown'}\n`;
+      message += `Balance: $${user.walletBalance.toFixed(2)}\n`;
+      message += `Registered: ${new Date(user.registrationDate).toLocaleString()}\n\n`;
+      
+      if (user.purchases.length > 0) {
+        message += `*Scripts:*\n`;
+        user.purchases.forEach((purchase, index) => {
+          message += `${index + 1}. ${purchase.scriptType}\n`;
+          message += `   Purchased: ${new Date(purchase.purchaseDate).toLocaleDateString()}\n`;
+          message += `   Expires: ${new Date(purchase.expiryDate).toLocaleDateString()}\n`;
+          if (purchase.vpsLogin) message += `   VPS Login: ${purchase.vpsLogin}\n`;
+          message += `   Price: $${purchase.price}\n\n`;
+        });
+      }
+      
+      if (user.cookiePurchases && user.cookiePurchases.length > 0) {
+        message += `*Cookie Links:*\n`;
+        user.cookiePurchases.forEach((purchase, index) => {
+          message += `${index + 1}. ${purchase.name}\n`;
+          message += `   Purchased: ${new Date(purchase.purchaseDate).toLocaleDateString()}\n`;
+          message += `   Status: ${purchase.delivered ? 'Delivered' : 'Pending'}\n\n`;
+        });
+      }
+      
+      if (user.smtpPurchases && user.smtpPurchases.length > 0) {
+        message += `*SMTP Servers:*\n`;
+        user.smtpPurchases.forEach((purchase, index) => {
+          message += `${index + 1}. ${purchase.name}\n`;
+          message += `   Purchased: ${new Date(purchase.purchaseDate).toLocaleDateString()}\n`;
+          message += `   Status: ${purchase.delivered ? 'Delivered' : 'Pending'}\n\n`;
+        });
+      }
+      
+      if (user.pendingDeposits && user.pendingDeposits.length > 0) {
+        message += `*Deposits:*\n`;
+        user.pendingDeposits.forEach((deposit, index) => {
+          message += `${index + 1}. $${deposit.amount.toFixed(2)}\n`;
+          message += `   TXID: ${deposit.txid}\n`;
+          message += `   Date: ${new Date(deposit.timestamp).toLocaleDateString()}\n`;
+          message += `   Status: ${deposit.confirmed ? 'Confirmed' : 'Pending'}\n\n`;
+        });
+      }
+      
+      // Add admin actions
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('💰 Add Balance', `add_balance_${user.userId}`)],
+        [Markup.button.callback('🔙 Back to Users List', 'back_to_users')]
+      ]);
+      
+      // Split message if too long
+      if (message.length > 4000) {
+        const parts = message.match(/.{1,4000}/gs);
+        for (let i = 0; i < parts.length; i++) {
+          if (i === parts.length - 1) {
+            // Only add keyboard to the last message
+            await ctx.replyWithMarkdown(parts[i], keyboard);
+          } else {
+            await ctx.replyWithMarkdown(parts[i]);
+          }
+        }
+      } else {
+        await ctx.replyWithMarkdown(message, keyboard);
+      }
+      
+      ctx.session.awaitingUserId = false;
+    } catch (error) {
+      console.error('Error fetching user details:', error);
+      await ctx.reply('An error occurred. Please try again later.');
+      ctx.session.awaitingUserId = false;
+    }
+  } else {
+    return next();
+  }
+});
+
+// Handle back to users list
+bot.action('back_to_users', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  try {
+    const users = await User.find().sort({ registrationDate: -1 });
+    const totalPages = Math.ceil(users.length / 10);
+    
+    await ctx.answerCbQuery();
+    await ctx.deleteMessage();
+    await sendUserPage(ctx, users, 1, totalPages);
+  } catch (error) {
+    console.error('Error returning to users list:', error);
+    await ctx.answerCbQuery('An error occurred');
+  }
+});
+
+// Handle add balance action
+bot.action(/add_balance_(\d+)/, async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    await ctx.answerCbQuery('Not authorized');
+    return;
+  }
+  
+  const userId = ctx.match[1];
+  await ctx.answerCbQuery();
+  await ctx.reply(`Please enter the amount to add to user ${userId}'s balance:`);
+  
+  if (!ctx.session) ctx.session = {};
+  ctx.session.addBalanceToUserId = userId;
+});
+
+// Handle balance amount input
+bot.on('text', async (ctx, next) => {
+  if (ctx.session && ctx.session.addBalanceToUserId) {
+    if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+      ctx.session.addBalanceToUserId = null;
+      return next();
+    }
+    
+    const amount = parseFloat(ctx.message.text.trim());
+    if (isNaN(amount)) {
+      await ctx.reply('Please enter a valid amount.');
+      return;
+    }
+    
+    try {
+      const userId = parseInt(ctx.session.addBalanceToUserId);
+      const user = await User.findOne({ userId });
+      if (!user) {
+        await ctx.reply(`User with ID ${userId} not found.`);
+        ctx.session.addBalanceToUserId = null;
+        return;
+      }
+      
+      user.walletBalance += amount;
+      await user.save();
+      
+      // Notify user
+      bot.telegram.sendMessage(userId, 
+        `💰 *Balance Update*\n\nYour account has been credited with $${amount.toFixed(2)}.\nNew balance: $${user.walletBalance.toFixed(2)}`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      await ctx.reply(`✅ Added $${amount.toFixed(2)} to user ${userId}'s balance. New balance: $${user.walletBalance.toFixed(2)}`);
+      ctx.session.addBalanceToUserId = null;
+    } catch (error) {
+      console.error('Error adding balance:', error);
+      await ctx.reply('An error occurred. Please try again later.');
+      ctx.session.addBalanceToUserId = null;
+    }
+  } else {
+    return next();
+  }
+});
+
+// Admin: Confirm deposits
+bot.hears('💲 Confirm Deposits', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+
+  try {
+    const users = await User.find({
+      'pendingDeposits.confirmed': false,
+    });
+
+    if (users.length === 0) {
+      return ctx.reply('No pending deposits found.');
+    }
+
+    let message = '💲 *Pending Deposits*\n\n';
+
+    for (const user of users) {
+      const pendingDeposits = user.pendingDeposits.filter((d) => !d.confirmed);
+      if (pendingDeposits.length > 0) {
+        // Escape special characters in the username
+        const escapedUsername = (user.username || 'Unknown').replace(
+          /([_*[\]()~`>#+=|{}.!-])/g,
+          '\\$1'
+        );
+
+        message += `👤 User: @${escapedUsername} \\(ID: ${user.userId}\\)\n`;
+        pendingDeposits.forEach((deposit, index) => {
+          // Escape special characters in the TXID
+          const escapedTxid = deposit.txid.replace(
+            /([_*[\]()~`>#+=|{}.!-])/g,
+            '\\$1'
+          );
+          
+          // Format the amount with escaped period
+          const formattedAmount = deposit.amount.toFixed(2).replace(/\./g, '\\.');
+          
+          // Format the date with all special characters escaped
+          const dateString = new Date(deposit.timestamp).toLocaleString();
+          const escapedDate = dateString.replace(
+            /([_*[\]()~`>#+=|{}.!-])/g,
+            '\\$1'
+          );
+
+          message += `${index + 1}\\. Amount: $${formattedAmount}\n`;
+          message += `   TXID: ${escapedTxid}\n`;
+          message += `   Date: ${escapedDate}\n`;
+          message += `   Confirm with: /confirmdeposit ${user.userId} ${deposit.amount}\n\n`;
+        });
+      }
+    }
+
+    await ctx.replyWithMarkdownV2(message);
+  } catch (error) {
+    console.error('Error fetching pending deposits:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+
+// Admin: Sales report
+bot.hears('📊 Sales Report', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  try {
+    const users = await User.find();
+    
+    let totalScriptSales = 0;
+    let totalCookieSales = 0;
+    let totalSmtpSales = 0;
+    let scriptCount = 0;
+    let cookieCount = 0;
+    let smtpCount = 0;
+    
+    // Calculate totals
+    users.forEach(user => {
+      user.purchases.forEach(purchase => {
+        totalScriptSales += purchase.price;
+        scriptCount++;
+      });
+      
+      if (user.cookiePurchases) {
+        user.cookiePurchases.forEach(purchase => {
+          // Estimate price if not stored directly
+          const price = purchase.price || 25; // Default estimate
+          totalCookieSales += price;
+          cookieCount++;
+        });
+      }
+      
+      if (user.smtpPurchases) {
+        user.smtpPurchases.forEach(purchase => {
+          // Estimate price if not stored directly
+          const price = purchase.price || 30; // Default estimate
+          totalSmtpSales += price;
+          smtpCount++;
+        });
+      }
+    });
+    
+    const totalSales = totalScriptSales + totalCookieSales + totalSmtpSales;
+    
+    let message = '📊 *Sales Report*\n\n';
+    message += `Total Sales: $${totalSales.toFixed(2)}\n\n`;
+    message += `Script Sales: $${totalScriptSales.toFixed(2)} (${scriptCount} units)\n`;
+    message += `Cookie Link Sales: $${totalCookieSales.toFixed(2)} (${cookieCount} units)\n`;
+    message += `SMTP Server Sales: $${totalSmtpSales.toFixed(2)} (${smtpCount} units)\n\n`;
+    
+    message += `Total Users: ${users.length}\n`;
+    message += `Active Users: ${users.filter(u => u.purchases.length > 0 || (u.cookiePurchases && u.cookiePurchases.length > 0) || (u.smtpPurchases && u.smtpPurchases.length > 0)).length}`;
+    
+    await ctx.replyWithMarkdown(message);
+  } catch (error) {
+    console.error('Error generating sales report:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Admin: Send notification to all users
+bot.hears('📢 Send Notification', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+    return ctx.reply('You are not authorized to use admin commands.');
+  }
+  
+  await ctx.reply('Please enter the message you want to send to all users:');
+  
+  if (!ctx.session) ctx.session = {};
+  ctx.session.awaitingBroadcastMessage = true;
+});
+
+// Handle broadcast message
+bot.on('text', async (ctx, next) => {
+  if (ctx.session && ctx.session.awaitingBroadcastMessage) {
+    if (ctx.from.id.toString() !== ADMIN_CHAT_ID) {
+      ctx.session.awaitingBroadcastMessage = false;
+      return next();
+    }
+    
+    const message = ctx.message.text;
+    
+    try {
+      const users = await User.find();
+      let sentCount = 0;
+      let failedCount = 0;
+      
+      await ctx.reply(`Sending message to ${users.length} users...`);
+      
+      for (const user of users) {
+        try {
+          await bot.telegram.sendMessage(user.userId, `📢 *Announcement*\n\n${message}`, {
+            parse_mode: 'Markdown'
+          });
+          sentCount++;
+        } catch (error) {
+          console.error(`Failed to send message to user ${user.userId}:`, error.message);
+          failedCount++;
+        }
+        
+        // Add a small delay to avoid hitting rate limits
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      ctx.session.awaitingBroadcastMessage = false;
+      await ctx.reply(`✅ Message sent to ${sentCount} users. Failed: ${failedCount}.`);
+    } catch (error) {
+      console.error('Error sending broadcast:', error);
+      await ctx.reply('An error occurred. Please try again later.');
+    }
+  } else {
+    return next();
+  }
+});
+
+// Help command
+bot.hears('❓ Help', async (ctx) => {
+  const helpText = `*BHB Lair Bot Help*
+
+This bot allows you to purchase BHB scripts, cookie links, and SMTP servers.
+
+*Available Commands:*
+• /start - Start the bot and see the main menu
+• 💰 My Account - View your account information and purchases
+• 🛒 Buy Scripts - Purchase BHB scripts
+• 🍪 Cookie Links - Browse and purchase cookie links
+• 📧 SMTP Servers - Browse and purchase SMTP servers
+• 💵 Deposit USDT - Add funds to your account
+• 🔄 Renewals - Renew your script subscriptions
+• ❓ Help - Show this help message
+
+*Payment Method:*
+We accept USDT (TRC20) payments. Follow the instructions in the 'Deposit USDT' section.
+
+*Support:*
+For any issues or questions, please contact an admin 
+
+`;
+
+  try {
+    await ctx.replyWithMarkdown(helpText);
+  } catch (error) {
+    console.error('Error sending help message:', error);
+    // If the markdown version fails, try sending without markdown
+    await ctx.reply('Error displaying help. Please contact the admin for assistance.');
+  }
+});
+
+// Renewals menu
+bot.hears('🔄 Renewals', async (ctx) => {
+  try {
+    const user = await User.findOne({ userId: ctx.from.id });
+    if (!user) {
+      return ctx.reply('Your account was not found. Please use /start to register.');
+    }
+    
+    if (user.purchases.length === 0) {
+      return ctx.reply('You don\'t have any scripts to renew. Please purchase a script first.');
+    }
+    
+    const keyboard = [];
+    
+    user.purchases.forEach(purchase => {
+      const scriptType = purchase.scriptType;
+      const scriptId = scriptType.includes('Toolkit') ? 'bhb_toolkit_pro' : 'bhb_365_lair';
+      const renewalPrice = scripts[scriptId].renewalPrice;
+      
+      keyboard.push([
+        Markup.button.callback(`Renew ${scriptType} - $${renewalPrice}`, `renew_${scriptId}`)
+      ]);
+    });
+    
+    await ctx.reply('Select a script to renew:', Markup.inlineKeyboard(keyboard));
+  } catch (error) {
+    console.error('Error in renewals menu:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  }
+});
+
+// Handle renewal
+bot.action(/renew_(.+)/, async (ctx) => {
+  try {
+    const scriptId = ctx.match[1];
+    const script = scripts[scriptId];
+    
+    if (!script) {
+      await ctx.answerCbQuery('Script not found.');
+      return ctx.reply('Script not found.');
+    }
+    
+    const user = await User.findOne({ userId: ctx.from.id });
+    if (!user) {
+      await ctx.answerCbQuery('Account not found.');
+      return ctx.reply('Your account was not found. Please use /start to register.');
+    }
+    
+    // Find the purchase to renew
+    const purchaseIndex = user.purchases.findIndex(p => 
+      p.scriptType === script.name
+    );
+    
+    if (purchaseIndex === -1) {
+      await ctx.answerCbQuery('You don\'t own this script.');
+      return ctx.reply('You don\'t own this script. Please purchase it first.');
+    }
+    
+    if (user.walletBalance < script.renewalPrice) {
+      await ctx.answerCbQuery('Insufficient balance.');
+      return ctx.reply(`Insufficient balance. You need $${script.renewalPrice.toFixed(2)} to renew ${script.name}. Your current balance is $${user.walletBalance.toFixed(2)}. Please deposit more funds.`);
+    }
+    
+    // Process renewal
+    user.walletBalance -= script.renewalPrice;
+    
+    const purchase = user.purchases[purchaseIndex];
+    const currentExpiry = new Date(purchase.expiryDate);
+    const newExpiry = new Date(currentExpiry);
+    newExpiry.setMonth(newExpiry.getMonth() + 1);
+    purchase.expiryDate = newExpiry;
+    
+    await user.save();
+    
+    // Notify admin
+    bot.telegram.sendMessage(ADMIN_CHAT_ID, 
+      `🔄 *Script Renewal*\n\nUser: @${user.username || 'Unknown'} (ID: ${user.userId})\nScript: ${script.name}\nAmount: $${script.renewalPrice}\nNew Expiry: ${newExpiry.toLocaleDateString()}\n\nNo action needed - renewal processed automatically.`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.answerCbQuery('Renewal successful!');
+    await ctx.reply(`✅ You have successfully renewed ${script.name}!\n\nYour subscription is now active until ${newExpiry.toLocaleDateString()}. Thank you!`);
+  } catch (error) {
+    console.error('Error in renewal:', error);
+    await ctx.answerCbQuery('An error occurred.');
+    await ctx.reply('An error occurred during renewal. Please try again later.');
+  }
+});
+
+// Check for expired scripts daily and notify users
+cron.schedule('0 0 * * *', async () => {
+  try {
+    console.log('Running daily script expiry check...');
+    
+    const today = new Date();
+    const threeDaysFromNow = new Date(today);
+    threeDaysFromNow.setDate(threeDaysFromNow.getDate() + 3);
+    
+    // Find users with scripts expiring in the next 3 days
+    const users = await User.find({
+      'purchases.expiryDate': {
+        $gte: today,
+        $lte: threeDaysFromNow
+      }
+    });
+    
+    for (const user of users) {
+      const expiringScripts = user.purchases.filter(p => {
+        const expiryDate = new Date(p.expiryDate);
+        return expiryDate >= today && expiryDate <= threeDaysFromNow;
+      });
+      
+      if (expiringScripts.length > 0) {
+        let message = `⚠️ *Script Expiry Reminder*\n\nThe following scripts will expire soon:\n\n`;
+        
+        expiringScripts.forEach(script => {
+          const expiryDate = new Date(script.expiryDate);
+          const daysLeft = Math.ceil((expiryDate - today) / (1000 * 60 * 60 * 24));
+          
+          message += `- ${script.scriptType}: Expires in ${daysLeft} day(s) (${expiryDate.toLocaleDateString()})\n`;
+        });
+        
+        message += `\nPlease use the 🔄 Renewals option in the main menu to extend your subscription.`;
+        
+        try {
+          await bot.telegram.sendMessage(user.userId, message, { parse_mode: 'Markdown' });
+          console.log(`Sent expiry reminder to user ${user.userId}`);
+        } catch (error) {
+          console.error(`Failed to send expiry reminder to user ${user.userId}:`, error.message);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error in daily script expiry check:', error);
+  }
+});
+
+// Handle unknown commands
+bot.on('text', async (ctx, next) => {
+  // If we've reached this point, the message wasn't handled by any previous handler
+  if (!ctx.session || (!ctx.session.awaitingDepositInfo && !ctx.session.awaitingCookieDetails && 
+      !ctx.session.awaitingSmtpDetails && !ctx.session.awaitingBroadcastMessage)) {
+    
+    // Check if it's a main menu option
+    const mainMenuOptions = ['🛒 Shop', '💰 My Account', '💵 Deposit USDT', '🔄 Renewals', '❓ Help'];
+    const shopMenuOptions = ['📜 Scripts', '🍪 Cookie Links', '📧 SMTP Servers', '🔙 Back to Main Menu'];
+    const adminMenuOptions = ['👥 View Users', '💲 Confirm Deposits', '📤 Pending Deliveries', 
+                             '📊 Sales Report', '🍪 Manage Cookies', '📧 Manage SMTPs', 
+                             '📢 Send Notification', '🔙 Exit Admin Mode'];
+    
+    if (!mainMenuOptions.includes(ctx.message.text) && 
+        !shopMenuOptions.includes(ctx.message.text) && 
+        !adminMenuOptions.includes(ctx.message.text)) {
+      
+      await ctx.reply('I don\'t understand that command. Please use the menu buttons or type /help for assistance.');
+    }
+  }
+  
+  return next();
+});
+
+// Error handling
+bot.catch((err, ctx) => {
+  console.error(`Error for ${ctx.updateType}:`, err);
+  ctx.reply('An error occurred while processing your request. Please try again later.').catch(e => {
+    console.error('Error sending error message:', e);
+  });
+});
+
+// Start the bot
+bot.launch()
+  .then(() => {
+    console.log('Bot started successfully!');
+  })
+  .catch(err => {
+    console.error('Failed to start bot:', err);
+  });
+
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+how do i make the server.js code above work for dicord and make it work on my glitch and make the admin be from web dashboard with user Blackbhb and password Blackpoopbot2  andwrite the full server.js above and everyother part needed to make the server.js above function well but with discord do not abbreviate nything write the full user interaction with the bot and thefull admin web dashboard write everything neeeded so i just copy and paste into my server.js without adding anything else
